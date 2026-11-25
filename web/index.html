@@ -1,0 +1,144 @@
+<!DOCTYPE html>
+<html lang="it">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>CutLab</title>
+<link rel="stylesheet" href="fonts.css">
+<link rel="stylesheet" href="style.css">
+<link rel="icon" href="icon.svg" type="image/svg+xml">
+</head>
+<body>
+
+<header class="topbar">
+  <div class="brand">
+    <svg class="logo" viewBox="0 0 24 24" aria-hidden="true">
+      <path d="M4 4v16M4 12h7M11 4v16" stroke="currentColor" stroke-width="1.8" fill="none" stroke-linecap="round"/>
+      <circle cx="18" cy="8" r="2.4" stroke="currentColor" stroke-width="1.6" fill="none"/>
+      <path d="M18 10.4V20" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/>
+    </svg>
+    <span>CutLab</span>
+  </div>
+  <div class="ctx" id="ctx">
+    <span class="ctx-line" id="ctxMain">Connessione a Resolve…</span>
+    <span class="ctx-sub" id="ctxSub"></span>
+  </div>
+  <div class="actions">
+    <button class="btn ghost" id="btnRefresh" title="Rileggi la timeline">
+      <svg viewBox="0 0 24 24" class="ic"><path d="M4 12a8 8 0 1 1 2.6 5.9M4 20v-5h5" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></svg>
+      Rileggi
+    </button>
+    <button class="btn primary" id="btnAnalyze" disabled>
+      <svg viewBox="0 0 24 24" class="ic"><path d="M5 17V9m5 8V5m5 12v-6m5 6V8" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round"/></svg>
+      Analizza
+    </button>
+  </div>
+</header>
+
+<main class="shell">
+
+  <section class="stage" id="stage">
+    <div class="stage-head">
+      <div class="tracks" id="trackChips"></div>
+      <div class="zoom">
+        <span class="zoom-label">Zoom</span>
+        <input type="range" id="zoom" min="1" max="12" step="0.5" value="1">
+      </div>
+    </div>
+
+    <div class="wave-wrap" id="waveWrap">
+      <canvas id="wave"></canvas>
+      <div class="empty" id="emptyState">
+        <h2>Nessuna analisi ancora</h2>
+        <p>Scegli le tracce, poi premi <strong>Analizza</strong>. CutLab trova le pause, distingue le voci e prepara il taglio sincronizzato su tutte le tracce.</p>
+        <button class="btn primary" id="btnAnalyze2">Analizza la timeline</button>
+      </div>
+      <div class="loading" id="loading" hidden>
+        <div class="bar"><i id="progressBar"></i></div>
+        <div class="loading-line"><span id="progressLabel">Analisi…</span><span id="progressPct">0%</span></div>
+        <pre class="log" id="log"></pre>
+      </div>
+    </div>
+
+    <div class="ruler-wrap"><canvas id="ruler"></canvas></div>
+
+    <div class="player">
+      <button class="btn icon" id="btnPlay" title="Ascolta il risultato">
+        <svg viewBox="0 0 24 24" class="ic"><path d="M8 5l11 7-11 7V5z" fill="currentColor"/></svg>
+      </button>
+      <audio id="audio" preload="metadata"></audio>
+      <div class="player-info" id="playerInfo">Anteprima del taglio non ancora generata</div>
+      <div class="legend" id="legend"></div>
+    </div>
+  </section>
+
+  <aside class="panel">
+
+    <section class="block">
+      <h3>Tracce da tagliare</h3>
+      <div class="field">
+        <label for="audioTrack">Audio da analizzare</label>
+        <select id="audioTrack" class="select"></select>
+      </div>
+      <div class="field">
+        <label>Video da tenere sincronizzati</label>
+        <div class="checkbox-list" id="videoTracks"></div>
+      </div>
+    </section>
+
+    <section class="block">
+      <h3>Voci</h3>
+      <div class="speakers" id="speakers"><p class="hint">Le voci compaiono dopo l'analisi.</p></div>
+    </section>
+
+    <section class="block">
+      <h3>Regole di taglio</h3>
+      <div class="slider">
+        <div class="slider-head"><label for="minPause">Pause più lunghe di</label><output id="minPauseOut">350 ms</output></div>
+        <input type="range" id="minPause" min="100" max="1500" step="10" value="350">
+        <p class="hint">Le pause più corte restano: toglierle fa saltare la frase.</p>
+      </div>
+      <div class="slider">
+        <div class="slider-head"><label for="padStart">Margine prima della parola</label><output id="padStartOut">120 ms</output></div>
+        <input type="range" id="padStart" min="0" max="400" step="10" value="120">
+      </div>
+      <div class="slider">
+        <div class="slider-head"><label for="padEnd">Margine dopo la parola</label><output id="padEndOut">150 ms</output></div>
+        <input type="range" id="padEnd" min="0" max="400" step="10" value="150">
+      </div>
+      <div class="slider">
+        <div class="slider-head"><label for="minSpeech">Scarta pezzi sotto</label><output id="minSpeechOut">250 ms</output></div>
+        <input type="range" id="minSpeech" min="80" max="800" step="10" value="250">
+      </div>
+    </section>
+
+    <section class="block stats" id="stats">
+      <h3>Risultato</h3>
+      <div class="stat-grid">
+        <div><span class="stat-v" id="statStart">—</span><span class="stat-k">durata originale</span></div>
+        <div><span class="stat-v" id="statEnd">—</span><span class="stat-k">durata tagliata</span></div>
+        <div><span class="stat-v" id="statPieces">—</span><span class="stat-k">pezzi</span></div>
+        <div><span class="stat-v" id="statCuts">—</span><span class="stat-k">tagli</span></div>
+      </div>
+      <p class="hint" id="statNote"></p>
+    </section>
+
+    <section class="block turns-block">
+      <h3>Battute <span class="count" id="turnsCount"></span></h3>
+      <div class="turns" id="turns"></div>
+    </section>
+
+    <div class="panel-foot">
+      <button class="btn primary wide" id="btnBuild" disabled>
+        <svg viewBox="0 0 24 24" class="ic"><path d="M4 7h16M4 12h10M4 17h13" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round"/></svg>
+        Crea timeline in Resolve
+      </button>
+      <p class="hint tiny" id="buildNote"></p>
+    </div>
+  </aside>
+</main>
+
+<div class="toast" id="toast" hidden></div>
+<script src="app.js"></script>
+</body>
+</html>
