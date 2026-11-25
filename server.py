@@ -31,6 +31,7 @@ import analyze  # noqa: E402
 import build as builder  # noqa: E402
 import cutplan  # noqa: E402
 import resolve_api as R  # noqa: E402
+import scriptmatch  # noqa: E402
 
 OUT = os.path.join(HERE, "out")
 os.makedirs(OUT, exist_ok=True)
@@ -49,6 +50,24 @@ class Job:
         self.log: list[str] = []
         self.error = None
         self.result: dict | None = None
+
+    def try_start(self) -> bool:
+        with self.lock:
+            if self.state == "running":
+                return False
+            self.state = "running"
+            self.progress = 0.0
+            self.error = None
+            self.log = []
+            self.result = None
+            return True
+
+    def finish(self, state: str, error: str | None = None, result: dict | None = None):
+        with self.lock:
+            self.state = state
+            self.error = error
+            if result is not None:
+                self.result = result
 
     def add(self, msg: str, prog: float | None = None):
         with self.lock:
@@ -114,7 +133,7 @@ def api_inventory(use_marks: bool = True):
         video.append({
             "index": t["index"], "clips": t["clip_count"], "generators": t["generators"],
             "names": t["names"][:4], "coverage": round(cov, 3),
-            "seconds": round((t["last"] or 0) - (t["first"] or 0), 1) / max(1, inv["fps"]),
+            "seconds": round(((t["last"] or 0) - (t["first"] or 0)) / max(1, inv["fps"]), 1),
         })
     audio = []
     for t in inv["audio_tracks"]:
@@ -154,11 +173,10 @@ class AnalyzeBody(BaseModel):
 
 @app.post("/api/analyze")
 def api_analyze(body: AnalyzeBody):
-    if JOB.state == "running":
+    if not JOB.try_start():
         return JSONResponse({"ok": False, "error": "analisi gia' in corso"}, status_code=409)
 
     def run():
-        JOB.state, JOB.progress, JOB.error, JOB.log, JOB.result = "running", 0.0, None, [], None
         try:
             JOB.add("leggo la timeline da Resolve", 0.03)
             inv = R.inventory(use_marks=body.use_marks)
@@ -226,14 +244,14 @@ def api_analyze(body: AnalyzeBody):
             A["params"] = body.model_dump()
             _recompute_plan()
             _save_state()
-            JOB.result = public_state()
+            res_state = public_state()
             JOB.add("analisi completata", 1.0)
-            JOB.state = "done"
+            JOB.finish("done", result=res_state)
         except Exception as e:  # noqa: BLE001
-            JOB.error = f"{type(e).__name__}: {e}"
-            JOB.add("ERRORE: " + JOB.error)
+            err = f"{type(e).__name__}: {e}"
+            JOB.add("ERRORE: " + err)
             traceback.print_exc()
-            JOB.state = "error"
+            JOB.finish("error", error=err)
 
     threading.Thread(target=run, daemon=True).start()
     return {"ok": True}
@@ -360,24 +378,32 @@ def _make_preview(plan: dict) -> dict | None:
     joined = np.concatenate(chunks)
     h = hashlib.sha1(f"{len(joined)}:{int(np.abs(joined).sum())}:{len(plan['segments'])}"
                      .encode()).hexdigest()[:12]
-    raw = os.path.join(OUT, f"preview_{h}.wav")
-    if not os.path.exists(raw):
-        analyze.write_wav(raw, joined, analyze.SR)
-        mp3 = raw.replace(".wav", ".mp3")
+    wav = os.path.join(OUT, f"preview_{h}.wav")
+    mp3 = os.path.join(OUT, f"preview_{h}.mp3")
+    if os.path.exists(mp3):
+        out_file = mp3
+    elif os.path.exists(wav):
+        out_file = wav
+    else:
+        analyze.write_wav(wav, joined, analyze.SR)
         try:
-            subprocess.run(["ffmpeg", "-y", "-v", "error", "-i", raw,
+            subprocess.run(["ffmpeg", "-y", "-v", "error", "-i", wav,
                             "-ar", "44100", "-b:a", "128k", mp3], check=True)
-            raw = mp3
+            out_file = mp3
+            try:
+                os.remove(wav)
+            except OSError:
+                pass
         except Exception:
-            pass
+            out_file = wav
+    keep_name = os.path.basename(out_file)
     for old in os.listdir(OUT):
-        if old.startswith("preview_") and not old.endswith(h + ".mp3") \
-                and not old.endswith(h + ".wav"):
+        if old.startswith("preview_") and old != keep_name:
             try:
                 os.remove(os.path.join(OUT, old))
             except OSError:
                 pass
-    return {"url": f"/api/preview/{os.path.basename(raw)}", "seconds": round(len(joined) / analyze.SR, 2)}
+    return {"url": f"/api/preview/{keep_name}", "seconds": round(len(joined) / analyze.SR, 2)}
 
 
 @app.get("/api/preview/{name}")
@@ -386,6 +412,46 @@ def api_preview(name: str):
     if not os.path.exists(p):
         return JSONResponse({"error": "non trovato"}, status_code=404)
     return FileResponse(p, media_type="audio/mpeg" if p.endswith(".mp3") else "audio/wav")
+
+
+# --------------------------------------------------------------------------- script match
+
+class ScriptBody(BaseModel):
+    text: str | None = None
+    docx_path: str | None = None
+    min_ratio: float = 0.55
+    preview: bool = True
+
+
+@app.post("/api/script")
+def api_script(body: ScriptBody):
+    """Allinea le battute trascritte allo script (testo o .docx) e aggiorna il piano."""
+    if not A.get("turns"):
+        return JSONResponse({"ok": False, "error": "nessuna analisi: lancia prima l'analisi"},
+                            status_code=200)
+    try:
+        script_text = body.text or ""
+        if not script_text and body.docx_path:
+            if not os.path.isfile(body.docx_path):
+                return JSONResponse({"ok": False, "error": "file .docx non trovato"}, status_code=200)
+            script_text = scriptmatch.read_docx_text(body.docx_path)
+        if not script_text.strip():
+            return JSONResponse({"ok": False, "error": "script vuoto"}, status_code=200)
+        res = scriptmatch.match_script(script_text, A["turns"], min_ratio=body.min_ratio)
+        if res["coverage"] >= 0.35 and res["keep"]:
+            keep_set = set(res["keep"])
+            for i, t in enumerate(A["turns"]):
+                t["keep"] = i in keep_set
+            plan = _recompute_plan()
+            prev = _make_preview(plan) if body.preview else None
+            _save_state()
+            return {"ok": True, "applied": True, "match": res,
+                    "plan": A["plan"], "preview": prev, "turns": A["turns"]}
+        return {"ok": True, "applied": False, "match": res,
+                "warning": "copertura troppo bassa (<35%): lo script non sembra corrispondere a questo girato"}
+    except Exception as e:  # noqa: BLE001
+        traceback.print_exc()
+        return JSONResponse({"ok": False, "error": f"{type(e).__name__}: {e}"}, status_code=200)
 
 
 # --------------------------------------------------------------------------- build
@@ -404,17 +470,24 @@ def api_build(body: BuildBody):
     if not A.get("plan"):
         return JSONResponse({"ok": False, "error": "nessun piano: analizza e rivedi prima"},
                             status_code=200)
-    if JOB.state == "running":
+    if not JOB.try_start():
         return JSONResponse({"ok": False, "error": "operazione in corso"}, status_code=409)
 
     def run():
-        JOB.state, JOB.progress, JOB.error, JOB.log, JOB.result = "running", 0.0, None, [], None
         try:
-            inv = A["inv"]
+            inv = A.get("inv")
+            if inv is None:
+                JOB.add("ricarico l'inventario della timeline da Resolve…", 0.01)
+                inv = R.inventory(use_marks=bool(A.get("params", {}).get("use_marks", True)))
+                want_tl = A.get("meta", {}).get("timeline")
+                if want_tl and inv.get("timeline") != want_tl:
+                    raise RuntimeError(
+                        f"In Resolve è aperta «{inv.get('timeline')}», ma il piano salvato è di «{want_tl}». "
+                        "Apri la timeline giusta o rilancia l'analisi.")
+                A["inv"] = inv
             plan = {"segments": A["plan"]["segments"]}
             if body.dry_run:
-                JOB.result = {"ok": True, "dry_run": True, "plan": A["plan"]}
-                JOB.state = "done"
+                JOB.finish("done", result={"ok": True, "dry_run": True, "plan": A["plan"]})
                 return
             JOB.add("salvo un .drp di sicurezza", 0.02)
             backup = R.backup_project("cutlab")
@@ -426,14 +499,13 @@ def api_build(body: BuildBody):
                 name_tracks=body.name_tracks,
                 progress=lambda m, p=None: JOB.add(m, p))
             res["backup"] = backup
-            JOB.result = res
             JOB.add("timeline pronta" if res.get("ok") else "verifica fallita", 1.0)
-            JOB.state = "done"
+            JOB.finish("done", result=res)
         except Exception as e:  # noqa: BLE001
-            JOB.error = f"{type(e).__name__}: {e}"
-            JOB.add("ERRORE: " + JOB.error)
+            err = f"{type(e).__name__}: {e}"
+            JOB.add("ERRORE: " + err)
             traceback.print_exc()
-            JOB.state = "error"
+            JOB.finish("error", error=err)
 
     threading.Thread(target=run, daemon=True).start()
     return {"ok": True}

@@ -159,7 +159,7 @@ def _mfcc_embed(sig: np.ndarray, utts: list[dict],
 
     rows = []
     for u in utts:
-        y = sig[int(u["start"] * SR):int(u["end"] * SR)].astype(np.float32)
+        y = _speech_only(sig, u, regions)
         if len(y) < int(0.2 * SR):
             y = np.pad(y, (0, int(0.2 * SR) - len(y)))
         m = librosa.feature.mfcc(y=y, sr=SR, n_mfcc=20)
@@ -242,7 +242,7 @@ def embed_utterances(sig: np.ndarray, utts: list[dict],
         with torch.no_grad():
             rows = []
             for u in utts:
-                y = sig[int(u["start"] * SR):int(u["end"] * SR)].astype(np.float32)
+                y = _speech_only(sig, u, regions)
                 if len(y) < int(0.35 * SR):
                     y = np.pad(y, (0, int(0.35 * SR) - len(y)))
                 t = torch.from_numpy(y).unsqueeze(0)
@@ -326,34 +326,85 @@ def cluster(x: np.ndarray, utts: list[dict], k: int | str = "auto",
 # --------------------------------------------------------------------------- ASR (opzionale)
 
 WHISPER_MODEL = os.environ.get("CUTLAB_WHISPER", "small")
+_WHISPER_CACHE: dict[tuple[str, str, str], object] = {}
+_CUDA_DLLS_READY = False
+
+
+def _register_cuda_dlls() -> None:
+    """Registra eventuali DLL CUDA installate via pip (nvidia-cublas/cudnn) su Windows."""
+    global _CUDA_DLLS_READY
+    if _CUDA_DLLS_READY or os.name != "nt":
+        return
+    _CUDA_DLLS_READY = True
+    try:
+        import site
+        for base in site.getsitepackages():
+            nv = os.path.join(base, "nvidia")
+            if not os.path.isdir(nv):
+                continue
+            for pkg in os.listdir(nv):
+                bindir = os.path.join(nv, pkg, "bin")
+                if os.path.isdir(bindir):
+                    try:
+                        os.add_dll_directory(bindir)
+                    except Exception:
+                        pass
+                    if bindir not in os.environ.get("PATH", ""):
+                        os.environ["PATH"] = bindir + os.pathsep + os.environ.get("PATH", "")
+    except Exception:
+        pass
+
+
+def _whisper_model(name: str, dev: str, ctype: str):
+    key = (name, dev, ctype)
+    m = _WHISPER_CACHE.get(key)
+    if m is None:
+        from faster_whisper import WhisperModel
+        m = WhisperModel(name, device=dev, compute_type=ctype)
+        _WHISPER_CACHE[key] = m
+    return m
 
 
 def transcribe(sig: np.ndarray, language: str | None = "it", model: str | None = None):
     """Trascrizione con word timestamps: serve *leggere* le battute in UI e
     verificare che il cameraman sia sparito. Non serve al taglio."""
-    from faster_whisper import WhisperModel
-
+    _register_cuda_dlls()
     name = model or WHISPER_MODEL
-    dev, ctype = "cpu", "int8"
-    try:
-        import torch
-        if torch.cuda.is_available():
-            dev, ctype = "cuda", "float16"
-    except Exception:
-        pass
-    try:
-        m = WhisperModel(name, device=dev, compute_type=ctype)
-    except Exception:
-        m = WhisperModel(name, device="cpu", compute_type="int8")
-        dev = "cpu"
-    segs, info = m.transcribe(sig.astype(np.float32), language=language,
-                              word_timestamps=True, vad_filter=False)
-    words = []
-    for s in segs:
-        for w in (s.words or []):
-            words.append({"start": round(w.start, 3), "end": round(w.end, 3),
-                          "text": w.word.strip()})
-    return {"words": words, "language": info.language, "device": dev, "model": name}
+    audio = sig.astype(np.float32)
+
+    candidates: list[tuple[str, str]] = []
+    forced_dev = os.environ.get("CUTLAB_WHISPER_DEVICE", "").strip().lower()
+    if forced_dev == "cpu":
+        candidates = [("cpu", "int8")]
+    else:
+        try:
+            import torch
+            if torch.cuda.is_available():
+                candidates.append(("cuda", "float16"))
+        except Exception:
+            pass
+        candidates.append(("cpu", "int8"))
+
+    last_err: Exception | None = None
+    for dev, ctype in candidates:
+        try:
+            m = _whisper_model(name, dev, ctype)
+            segs, info = m.transcribe(audio, language=language,
+                                      word_timestamps=True, vad_filter=False)
+            words = []
+            for s in segs:
+                for w in (s.words or []):
+                    words.append({"start": round(w.start, 3), "end": round(w.end, 3),
+                                  "text": w.word.strip()})
+            return {"words": words, "language": info.language, "device": dev, "model": name}
+        except Exception as exc:  # noqa: BLE001
+            # Su GPU recenti (es. RTX 5090 sm_120) CTranslate2/cuBLAS puo' fallire
+            # durante l'iterazione di segs: si riprova pulitamente in CPU.
+            last_err = exc
+            _WHISPER_CACHE.pop((name, dev, ctype), None)
+            if dev == "cpu":
+                raise
+    raise last_err or RuntimeError("trascrizione Whisper fallita")
 
 
 def text_for_utterances(words: list[dict], utts: list[dict]) -> None:

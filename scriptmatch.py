@@ -12,6 +12,7 @@ labels = [0, 1, 2, ...]: cosi' "tieni i cluster" diventa "tieni queste battute".
 from __future__ import annotations
 
 import difflib
+import html
 import re
 import unicodedata
 import zipfile
@@ -30,6 +31,7 @@ def read_docx_text(path: str) -> str:
     # già nel testo grezzo, quindi si unisce e si normalizza in un secondo momento
     raw = re.sub(r"<[^>]+>", "", re.sub(r"</w:p>", "\n", xml))
     text = raw if len(raw) > sum(len(p) for p in parts) else "".join(parts)
+    text = html.unescape(text)
     return unicodedata.normalize("NFC", text)
 
 
@@ -80,13 +82,21 @@ def match_script(script_text: str, utts: list[dict], min_ratio: float = 0.55,
                     .get_matching_blocks()
                 size = sum(b.size for b in blocks)
                 ratio = size / len(lt)
-                if best is None or ratio > best[0]:
-                    best = (ratio, w0, span, size)
+                # Preferisci: (1) ratio migliore (tolleranza 0.02 per take equivalenti),
+                # (2) span piu' compatto (meno parole spurie), (3) l'ultimo take (w0 piu' alto)
+                precision = size / max(1, len(at))
+                cand = (ratio, precision, -span, w0, span, size)
+                if best is None:
+                    best = cand
+                elif ratio > best[0] + 0.02:
+                    best = cand
+                elif abs(ratio - best[0]) <= 0.02 and (precision, -span, w0) > (best[1], best[2], best[3]):
+                    best = cand
         if best and best[0] >= min_ratio:
-            matched_tokens += best[3]
-            for k in range(best[1], best[1] + best[2]):
+            matched_tokens += best[5]
+            for k in range(best[3], best[3] + best[4]):
                 keep.add(k)
-            hits.append({"ratio": round(best[0], 3), "utt": best[1],
+            hits.append({"ratio": round(best[0], 3), "utt": best[3],
                          "line": ln[:90]})
         else:
             missing.append(ln[:120])

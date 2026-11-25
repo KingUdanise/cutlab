@@ -137,9 +137,13 @@ def build(plan: dict, inv: dict, video_tracks: list[int], audio_track: int,
 
     log(f"timeline «{new_name}» creata", 0.05)
 
-    expected: dict[int, list[tuple[int, int]]] = {i: [] for i in video_tracks}
+    expected: dict[int | str, list[tuple[int, int]]] = {i: [] for i in video_tracks}
     expected["a"] = []
-    offset = 0
+    try:
+        base_frame = int(tl.GetStartFrame() or 0)
+    except Exception:
+        base_frame = 0
+    offset = base_frame
     total = len(segs)
     appended = 0
 
@@ -147,36 +151,39 @@ def build(plan: dict, inv: dict, video_tracks: list[int], audio_track: int,
         dur = s["f1"] - s["f0"]
         if dur <= 0:
             continue
-        row = {}
         for vi, ti in enumerate(video_tracks, start=1):
             pcs = pieces_for(vmeta[ti]["items"], s["f0"], s["f1"], fps)
-            if len(pcs) != 1:
+            if not pcs or sum(pc["end"] - pc["start"] for pc in pcs) != dur:
                 raise BuildError(
-                    f"segmento {n}: la traccia V{ti} non e' continua "
-                    f"({len(pcs)} pezzi). Rilancia il piano con la validazione tracce.")
-            pc = pcs[0]
-            if not append(pc, 1, vi, offset):
-                raise BuildError(f"append fallito su V{vi} (segmento {n})")
-            row[vi] = pc
-            appended += 1
-            if n == 1 and vi == 1:
-                # primo append: se non e' atterrato, l'ambiente non e' pronto
-                landed = tl.GetItemListInTrack("video", 1) or []
-                if not landed:
-                    raise BuildError("Resolve non ha registrato il primo clip: "
-                                     "la timeline corrente non è quella nuova. Riprova.")
+                    f"segmento {n}: la traccia V{ti} ha un buco nel range "
+                    f"[{s['f0']}..{s['f1']}). Rilancia il piano con la validazione tracce.")
+            sub_off = offset
+            for pi, pc in enumerate(pcs):
+                pc_dur = pc["end"] - pc["start"]
+                if not append(pc, 1, vi, sub_off):
+                    raise BuildError(f"append fallito su V{vi} (segmento {n}, pezzo {pi + 1})")
+                expected[ti].append((sub_off, pc_dur))
+                sub_off += pc_dur
+                appended += 1
+                if n == 1 and vi == 1 and pi == 0:
+                    # primo append: se non e' atterrato, l'ambiente non e' pronto
+                    landed = tl.GetItemListInTrack("video", 1) or []
+                    if not landed:
+                        raise BuildError("Resolve non ha registrato il primo clip: "
+                                         "la timeline corrente non è quella nuova. Riprova.")
 
         pcs = pieces_for(ameta[audio_track]["items"], s["f0"], s["f1"], fps)
-        if len(pcs) != 1:
-            raise BuildError(f"segmento {n}: la traccia audio non e' continua ({len(pcs)} pezzi).")
-        pc = pcs[0]
-        if not append(pc, 2, 1, offset):
-            raise BuildError(f"append fallito su A1 (segmento {n})")
-        appended += 1
+        if not pcs or sum(pc["end"] - pc["start"] for pc in pcs) != dur:
+            raise BuildError(f"segmento {n}: la traccia audio ha un buco nel range [{s['f0']}..{s['f1']}).")
+        sub_off = offset
+        for pi, pc in enumerate(pcs):
+            pc_dur = pc["end"] - pc["start"]
+            if not append(pc, 2, 1, sub_off):
+                raise BuildError(f"append fallito su A1 (segmento {n}, pezzo {pi + 1})")
+            expected["a"].append((sub_off, pc_dur))
+            sub_off += pc_dur
+            appended += 1
 
-        for vi in video_tracks:
-            expected[vi].append((offset, dur))
-        expected["a"].append((offset, dur))
         offset += dur
         if n % 5 == 0 or n == total:
             log(f"pezzo {n}/{total} appeso", 0.05 + 0.85 * n / total)
@@ -205,10 +212,11 @@ def build(plan: dict, inv: dict, video_tracks: list[int], audio_track: int,
     report = _verify(tl, expected, video_tracks)
     ok = report["ok"]
     log("fatto" if ok else "verifica fallita", 1.0)
+    total_frames = offset - base_frame
     return {
         "timeline": new_name,
-        "frames": offset,
-        "seconds": round(offset / fps, 2),
+        "frames": total_frames,
+        "seconds": round(total_frames / fps, 2),
         "pieces": len(segs),
         "clips": appended,
         "video_tracks": video_tracks,
@@ -235,13 +243,16 @@ def _verify(tl, expected: dict, video_tracks: list[int]) -> dict:
     if got_a != expected["a"]:
         problems.append(f"A1 diversa: {_diff(expected['a'], got_a)}")
 
-    # allineamento: ogni pezzo i deve iniziare allo stesso frame su tutte le tracce
-    sets = {f"V{v}": [(int(x.GetStart())) for x in (tl.GetItemListInTrack("video", v) or [])]
-            for v in range(1, len(video_tracks) + 1)}
-    sets["A1"] = [int(x.GetStart()) for x in (tl.GetItemListInTrack("audio", 1) or [])]
-    starts = list(sets.values())
-    if starts and any(s != starts[0] for s in starts):
-        problems.append("i punti di taglio non coincidono tra le tracce")
+    # allineamento: copertura totale (start primo clip, end ultimo clip) coerente su tutte le tracce
+    spans = {}
+    for v in range(1, len(video_tracks) + 1):
+        xs = tl.GetItemListInTrack("video", v) or []
+        spans[f"V{v}"] = (int(xs[0].GetStart()), int(xs[-1].GetStart()) + int(xs[-1].GetDuration())) if xs else None
+    xs_a = tl.GetItemListInTrack("audio", 1) or []
+    spans["A1"] = (int(xs_a[0].GetStart()), int(xs_a[-1].GetStart()) + int(xs_a[-1].GetDuration())) if xs_a else None
+    vals = list(spans.values())
+    if vals and any(s != vals[0] for s in vals):
+        problems.append("inizio/fine della timeline non coincidono tra le tracce")
     return {"ok": not problems, "problems": problems, "counts": counts,
             "pieces": len(expected.get("a", []))}
 
